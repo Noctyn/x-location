@@ -4,9 +4,10 @@
 
 ## 安装
 
-使用前需在浏览器中安装 [Tampermonkey](https://www.tampermonkey.net/) 或 Violentmonkey 扩展：
+使用前需在浏览器中安装 [Tampermonkey](https://www.tampermonkey.net/) 或 Violentmonkey 扩展，通过以下任一途径安装：
 
-👉 **[点击直接安装](https://raw.githubusercontent.com/Noctyn/x-location/main/x-location.user.js)**
+- **[Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/602309)**（推荐）
+- **[GitHub 直接安装](https://raw.githubusercontent.com/Noctyn/x-location/main/x-location.user.js)**
 
 ## 主要特性
 
@@ -23,9 +24,16 @@
 - **流控与缓存**：
   - **本地缓存**：内置 24 小时持久化缓存（上限 1000 条），避免重复请求同一账号。
   - **限流退避**：请求队列控制与针对 429 的自动退避机制，防止触发 X 频率限制。
-- **轻量无越权**：
-  - 使用 `@grant none`，纯粹在网页原生上下文运行，不申请额外的扩展高危权限。
+- **轻量权限**：
+  - 仅申请菜单开关所需的最小权限（`GM_registerMenuCommand`、`GM_unregisterMenuCommand`、`unsafeWindow`），不读取其他站点数据。
   - 自动适配页面语言（中文 / 英文）。
+
+## 设置
+
+- **悬浮资料卡属地**：默认开启。点击浏览器工具栏的 Tampermonkey 图标，在脚本菜单中点击「悬浮卡属地：开/关」即可切换。
+- **时间线推文属地**：默认关闭。在同一菜单中点击「时间线属地：开/关」切换。
+- 也可以在 X 页面控制台执行 `xLocSetHover(false)`、`xLocSetTimeline(true)` 等命令。
+- 设置保存在浏览器本地，刷新或重启后仍然有效。
 
 ## 许可证
 

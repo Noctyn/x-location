@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/Noctyn/x-location/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/x-location/main/x-location.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/x-location/main/x-location.user.js
-// @version      0.37
+// @version      0.44
 // @description  悬浮资料卡（HoverCard）用户名下方与推文 / 引用推文时间戳旁，以原生风格徽章显示「账号所在地 / App Store 区域」
 // @author       Noctyn
 // @license      MIT
@@ -14,10 +14,22 @@
 // @match        https://twitter.com/*
 // @run-at       document-idle
 // @noframes
-// @grant        none
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @grant        unsafeWindow
+// ==/UserScript==
 
 (function () {
     'use strict';
+
+    // 控制台位于页面作用域，沙箱模式下需要用 unsafeWindow 暴露开关函数
+    const pageWindow = (() => {
+        try {
+            return typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
+        } catch (e) {
+            return window;
+        }
+    })();
 
     /*****************************************************************
      * 配置区
@@ -66,13 +78,37 @@
 
     const HANDLE_RE = /^@[A-Za-z0-9_]{1,15}$/;
 
-    // 设置：'1' = 同时在时间线推文旁显示属地；默认关闭，只在悬浮资料卡里显示
-    const TIMELINE_KEY = 'xLocTimeline_v1';
+    // 设置：'1' = 开启，'0' = 关闭；未设置时使用默认值
+    const HOVER_KEY = 'xLocHover_v1';        // 悬浮资料卡显示属地，默认开启
+    const TIMELINE_KEY = 'xLocTimeline_v1';  // 时间线推文显示属地，默认关闭
 
     const DEBUG = false;
+    const LOG_RATE_LIMIT = true;             // 调试用：每次请求后输出响应头里的限流配额，改成 false 关闭
 
     function log(...args) {
         if (DEBUG) console.log('[X-AccountLocation]', ...args);
+    }
+
+    function logRateLimit(res, screenName) {
+        if (!LOG_RATE_LIMIT) return;
+        const limit = res.headers.get('x-rate-limit-limit');
+        const remaining = res.headers.get('x-rate-limit-remaining');
+        const reset = res.headers.get('x-rate-limit-reset');
+        const resetAt = Number(reset) > 0
+            ? new Date(Number(reset) * 1000).toLocaleString()
+            : '未知';
+        console.info(
+            `[X-AccountLocation] ${screenName} 限流：剩余 ${remaining ?? '?'} / ${limit ?? '?'}，重置 ${resetAt}`,
+            { status: res.status, limit, remaining, reset, resetAt }
+        );
+    }
+
+    function loadHoverSetting() {
+        try {
+            return localStorage.getItem(HOVER_KEY) !== '0';
+        } catch (e) {
+            return true;
+        }
     }
 
     function loadTimelineSetting() {
@@ -83,6 +119,7 @@
         }
     }
 
+    let showHover = loadHoverSetting();
     let showTimeline = loadTimelineSetting();
 
     /*****************************************************************
@@ -121,8 +158,10 @@
             vpn: '疑似 VPN',
             vpnTip: 'X 提示该账号的所在地可能不准确（可能使用了 VPN / 代理）',
             web: '网页端',
-            menuOn: '时间线推文显示属地：已开启（点击关闭）',
-            menuOff: '时间线推文显示属地：已关闭（点击开启）',
+            hoverMenuOn: '悬浮卡属地：开（点击关闭）',
+            hoverMenuOff: '悬浮卡属地：关（点击开启）',
+            menuOn: '时间线属地：开（点击关闭）',
+            menuOff: '时间线属地：关（点击开启）',
         },
         en: {
             group: 'Account location info',
@@ -132,8 +171,10 @@
             vpn: 'Possible VPN',
             vpnTip: 'X says this location may be inaccurate (possibly a VPN / proxy)',
             web: 'Web',
-            menuOn: 'Timeline badges: ON (click to turn off)',
-            menuOff: 'Timeline badges: OFF (click to turn on)',
+            hoverMenuOn: 'Hover card: ON (click to turn off)',
+            hoverMenuOff: 'Hover card: OFF (click to turn on)',
+            menuOn: 'Timeline: ON (click to turn off)',
+            menuOff: 'Timeline: OFF (click to turn on)',
         },
     };
 
@@ -552,6 +593,7 @@
         const promise = (async () => {
             try {
                 const res = await requestAbout(screenName);
+                logRateLimit(res, screenName);
 
                 if (res.status === 429) {
                     const reset = Number(res.headers.get('x-rate-limit-reset')) * 1000;
@@ -997,8 +1039,9 @@
         }
     }
 
-    // card -> { key, root, dismissed }，记录“这张卡片正在处理谁”
+    // card -> { key, root, dismissed, gen }，记录“这张卡片正在处理谁”
     const cardStates = new WeakMap();
+    let hoverGeneration = 0;
 
     async function handleHoverCard(card) {
         const handleSpan = findHandleSpan(card);
@@ -1012,21 +1055,21 @@
         if (!nameAnchor) return; // 卡片内容还没渲染完，等下一次 mutation
 
         const prev = cardStates.get(card);
-        if (prev && prev.key === key) {
+        if (prev && prev.key === key && prev.gen === hoverGeneration) {
             // 同一张卡片、同一个用户：若徽章被 React 重渲染冲掉了，补挂回去
             if (!prev.dismissed && !prev.root.isConnected) mount(prev.root, nameAnchor, handleSpan);
             return;
         }
 
-        // 卡片被复用于另一个用户：清掉旧徽章
+        // 卡片被复用于另一个用户，或开关状态刚变过：清掉旧徽章
         if (prev) prev.root.remove();
         card.querySelectorAll(OWN_SEL).forEach((el) => el.remove());
 
         const root = createRoot(handleSpan, nameAnchor);
-        const state = { key, root, dismissed: false };
+        const state = { key, root, dismissed: false, gen: hoverGeneration };
         cardStates.set(card, state);
 
-        const stillValid = () => card.isConnected && cardStates.get(card) === state;
+        const stillValid = () => showHover && card.isConnected && cardStates.get(card) === state;
         const dismiss = () => {
             state.dismissed = true;
             fadeOut(root);
@@ -1073,6 +1116,7 @@
     }
 
     function scanHoverCards() {
+        if (!showHover) return;
         document.querySelectorAll(CARD_SEL).forEach((card) => {
             handleHoverCard(card);
         });
@@ -1588,22 +1632,50 @@
         if (showTimeline) scanTweets();
     }
 
-    /* ---------- 设置：时间线推文是否显示属地 ---------- */
+    /* ---------- 设置：悬浮卡 / 时间线是否显示属地 ---------- */
 
-    let menuId = null;
+    let menuIds = [];
 
     function registerMenu() {
         if (typeof GM_registerMenuCommand !== 'function') return;
         try {
-            if (menuId !== null && typeof GM_unregisterMenuCommand === 'function') {
-                GM_unregisterMenuCommand(menuId);
+            if (typeof GM_unregisterMenuCommand === 'function') {
+                menuIds.forEach((id) => GM_unregisterMenuCommand(id));
+            } else if (menuIds.length) {
+                return; // 无法注销时避免重复注册
             }
-            menuId = GM_registerMenuCommand(t(showTimeline ? 'menuOn' : 'menuOff'), () => {
-                setTimelineSetting(!showTimeline);
-            });
+            menuIds = [
+                GM_registerMenuCommand(t(showHover ? 'hoverMenuOn' : 'hoverMenuOff'), () => {
+                    setHoverSetting(!showHover);
+                }),
+                GM_registerMenuCommand(t(showTimeline ? 'menuOn' : 'menuOff'), () => {
+                    setTimelineSetting(!showTimeline);
+                }),
+            ].filter(Boolean);
         } catch (e) {
             log('注册菜单失败:', e);
         }
+    }
+
+    function applyHoverSetting(on) {
+        if (on === showHover) return;
+        showHover = on;
+        hoverGeneration++;
+        if (on) {
+            scheduleScan();
+        } else {
+            document.querySelectorAll(OWN_SEL).forEach((el) => el.remove());
+        }
+        registerMenu();
+    }
+
+    function setHoverSetting(on) {
+        try {
+            localStorage.setItem(HOVER_KEY, on ? '1' : '0');
+        } catch (e) {
+            // 存储被禁用时仅本次页面内有效
+        }
+        applyHoverSetting(on);
     }
 
     function applyTimelineSetting(on) {
@@ -1639,14 +1711,24 @@
     }
 
     function init() {
-        log('归属地标注脚本启动 v0.41');
+        log('归属地标注脚本启动 v0.44');
         injectStyles();
         registerMenu();
+
+        // 控制台后备：xLocSetHover(false) / xLocSetTimeline(true)
+        try {
+            pageWindow.xLocSetHover = (on) => setHoverSetting(!!on);
+            pageWindow.xLocSetTimeline = (on) => setTimelineSetting(!!on);
+        } catch (e) {
+            // ignore
+        }
+
         scanAll();
 
         const mo = new MutationObserver((mutations) => {
-            // 时间线关闭时只关心悬浮卡，减少无谓的扫描
-            const sel = showTimeline ? TRIGGER_SEL : CARD_SEL;
+            // 两个开关都关闭时无需扫描；只开时间线时才需要监听推文相关节点
+            const sel = showTimeline ? TRIGGER_SEL : (showHover ? CARD_SEL : '');
+            if (!sel) return;
             for (const m of mutations) {
                 for (const n of m.addedNodes) {
                     if (n.nodeType !== 1) continue;
@@ -1685,7 +1767,8 @@
 
         // 其他标签页改了开关时同步
         window.addEventListener('storage', (e) => {
-            if (e.key === TIMELINE_KEY) applyTimelineSetting(e.newValue === '1');
+            if (e.key === HOVER_KEY) applyHoverSetting(e.newValue !== '0');
+            else if (e.key === TIMELINE_KEY) applyTimelineSetting(e.newValue === '1');
         });
 
         // 页面关闭 / 切到后台前，立即把防抖期内的缓存落盘
