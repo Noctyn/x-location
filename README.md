@@ -28,6 +28,18 @@
   - 仅申请菜单开关所需的最小权限（`GM_registerMenuCommand`、`GM_unregisterMenuCommand`、`unsafeWindow`），不读取其他站点数据。
   - 自动适配页面语言（中文 / 英文）。
 
+## 界面预览
+
+### 悬浮资料卡（HoverCard）
+鼠标悬停在用户头像或用户名上时，展示账号归属国家、连接来源（如 App Store 区域 / 网页端）以及代理风险预警：
+
+![悬浮名片预览](https://raw.githubusercontent.com/Noctyn/x-location/main/assets/preview-hovercard.png)
+
+### 时间线推文时间戳
+在时间线推文与引用推文的时间戳右侧直接显示紧凑型归属地徽章：
+
+![推文时间戳徽章预览](https://raw.githubusercontent.com/Noctyn/x-location/main/assets/preview-tweet.png)
+
 ## 设置
 
 - **悬浮资料卡属地**：默认开启。点击浏览器工具栏的 Tampermonkey 图标，在脚本菜单中点击「悬浮卡属地：开/关」即可切换。
