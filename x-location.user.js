@@ -15,7 +15,6 @@
 // @run-at       document-idle
 // @noframes
 // @grant        none
-// ==/UserScript==
 
 (function () {
     'use strict';
@@ -29,16 +28,27 @@
     const DEFAULT_QUERY_ID = 'zs_jFPFT78rBpXv9Z3U2YQ';
     const QUERY_ID_KEY = 'xLocQueryId_v1';
     const QUERY_ID_RECHECK = 30 * 60 * 1000;   // 两次自动发现之间的最短间隔
+    const DISCOVER_CONCURRENCY = 4;            // 自动发现时并发扫描的 bundle 数
+    const DISCOVER_MAX_BUNDLES = 16;
 
     const AUTH_BEARER =
         'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
 
     const CACHE_KEY = 'xLocCache_v1';
-    const CACHE_TTL = 24 * 3600 * 1000;      // 缓存 24 小时
-    const CACHE_MAX_ENTRIES = 1000;          // 持久化缓存上限
-    const ERROR_COOLDOWN = 60 * 1000;        // 单用户失败后冷却 60 秒
-    const DEFAULT_BACKOFF = 5 * 60 * 1000;   // 429 / query ID 失效时的全局退避
-    const HOVER_DELAY = 300;                 // 卡片出现后延迟多久才发请求（毫秒）
+    const CACHE_TTL = 3 * 24 * 3600 * 1000;      // 有数据的结果缓存 3 天（所在地很少变）
+    const CACHE_TTL_EMPTY = 12 * 3600 * 1000;    // 无数据的结果缓存 12 小时
+    const CACHE_MAX_ENTRIES = 1000;              // 持久化缓存上限
+    const ERROR_COOLDOWN = 60 * 1000;            // 单用户失败后冷却 60 秒
+    const DEFAULT_BACKOFF = 5 * 60 * 1000;       // 429 / query ID 失效时的全局退避
+    const AUTH_BACKOFF = 3 * 60 * 1000;          // 401（登录态失效）时的全局退避
+    const ERROR_COOLDOWN_MAX = 30 * 60 * 1000;   // 同一用户反复失败时，冷却时间指数增长的上限
+    const FAIL_STREAK_LIMIT = 6;                 // 连续这么多次失败（中间没有任何成功）才视为整体异常
+    const FAIL_BACKOFF_BASE = 2 * 60 * 1000;     // 整体异常的首次退避，之后每次翻倍
+    const FAIL_BACKOFF_MAX = 15 * 60 * 1000;
+    const RATE_LIMIT_LOW = 3;                    // 剩余配额 ≤ 该值时主动退避到窗口重置
+    const PACE_BELOW = 0.5;                      // 剩余配额低于上限的这个比例后，推文请求开始放慢
+    const TWEET_PACE_MAX = 20 * 1000;            // 放慢后两次请求的最大间隔
+    const HOVER_DELAY = 300;                     // 卡片出现后延迟多久才发请求（毫秒）
 
     const CARD_SEL = '[data-testid="HoverCard"]';
     const OWN_ATTR = 'data-x-location-hover-tag';
@@ -49,15 +59,31 @@
     const USER_NAME_SEL = '[data-testid="User-Name"]';
     const TWEET_BADGE_ATTR = 'data-xlt-tweet-badge';
     const TWEET_BADGE_SEL = `[${TWEET_BADGE_ATTR}]`;
-    const TWEET_FETCH_INTERVAL = 600;        // 推文徽章两次请求的最小间隔
-    const TWEET_QUEUE_LIMIT = 60;            // 队列上限，超出时等下一轮扫描
+    const TRIGGER_SEL = [CARD_SEL, TWEET_SEL, USER_NAME_SEL, 'time'].join(',');
+    const TWEET_FETCH_INTERVAL = 600;        // 推文徽章两次「真实网络请求」的最小间隔
+    const TWEET_QUEUE_LIMIT = 60;            // 队列上限（按用户计），超出时等队列排空后补扫
     const TWEET_RETRY_DELAY = 60 * 1000;     // 无数据 / 失败后的重试间隔
+
+    const HANDLE_RE = /^@[A-Za-z0-9_]{1,15}$/;
+
+    // 设置：'1' = 同时在时间线推文旁显示属地；默认关闭，只在悬浮资料卡里显示
+    const TIMELINE_KEY = 'xLocTimeline_v1';
 
     const DEBUG = false;
 
     function log(...args) {
         if (DEBUG) console.log('[X-AccountLocation]', ...args);
     }
+
+    function loadTimelineSetting() {
+        try {
+            return localStorage.getItem(TIMELINE_KEY) === '1';
+        } catch (e) {
+            return false;
+        }
+    }
+
+    let showTimeline = loadTimelineSetting();
 
     /*****************************************************************
      * 通用工具
@@ -95,6 +121,8 @@
             vpn: '疑似 VPN',
             vpnTip: 'X 提示该账号的所在地可能不准确（可能使用了 VPN / 代理）',
             web: '网页端',
+            menuOn: '时间线推文显示属地：已开启（点击关闭）',
+            menuOff: '时间线推文显示属地：已关闭（点击开启）',
         },
         en: {
             group: 'Account location info',
@@ -104,6 +132,8 @@
             vpn: 'Possible VPN',
             vpnTip: 'X says this location may be inaccurate (possibly a VPN / proxy)',
             web: 'Web',
+            menuOn: 'Timeline badges: ON (click to turn off)',
+            menuOff: 'Timeline badges: OFF (click to turn on)',
         },
     };
 
@@ -146,7 +176,7 @@
         for (const lang of langs) {
             let dn;
             try {
-                dn = new Intl.DisplayNames([lang], { type: 'region' });
+                dn = new Intl.DisplayNames([lang], { type: 'region', fallback: 'none' });
             } catch (e) {
                 continue;
             }
@@ -160,7 +190,7 @@
                     } catch (e) {
                         continue;
                     }
-                    if (name && name !== code) {
+                    if (name) {
                         const k = norm(name);
                         if (!countryIndex.has(k)) countryIndex.set(k, code);
                     }
@@ -267,46 +297,113 @@
     const hasInfo = (info) => !!(info && (info.country || info.appStoreRegion));
 
     /*****************************************************************
-     * 缓存（带 TTL，持久化到 localStorage）
+     * 缓存（带 TTL，持久化到 localStorage，多标签页合并写入）
      *****************************************************************/
 
     const locationCache = new Map();     // key -> { v, t }
     const inFlightRequests = new Map();  // key -> Promise
     const errorUntil = new Map();        // key -> 冷却截止时间
+    const errorCount = new Map();        // key -> 连续失败次数（用于指数冷却）
     let globalBackoffUntil = 0;
+    let failStreak = 0;                  // 连续失败次数（任一成功响应后清零）
+    let streakBackoffs = 0;              // 已触发的整体退避次数（成功后清零）
+    let rateLimit = 0;                   // 最近一次响应里的配额上限 / 剩余 / 重置时间
+    let rateRemaining = null;
+    let rateResetAt = 0;
 
-    try {
-        const saved = JSON.parse(localStorage.getItem(CACHE_KEY) || '{}');
-        const now = Date.now();
-        for (const [k, e] of Object.entries(saved)) {
-            if (e && typeof e.t === 'number' && now - e.t < CACHE_TTL) locationCache.set(k, e);
-        }
-        log('已恢复缓存条目数:', locationCache.size);
-    } catch (e) {
-        // 忽略损坏的缓存
+    // 进入全局退避。这类事件很少见，所以始终在控制台打一行，方便排查「为什么没有徽章」
+    function backoffFor(reason, until) {
+        if (until <= globalBackoffUntil) return;
+        globalBackoffUntil = until;
+        console.info(`[X-AccountLocation] 暂停请求（${reason}），恢复时间 ${new Date(until).toLocaleTimeString()}`);
     }
 
+    // 单个账号返回 400 / 403 / 404 很常见（已删除、屏蔽了你、受限等），
+    // 只有连续多次失败、中间没有一次成功，才认为是整体异常
+    function noteFailure(status) {
+        failStreak++;
+        if (failStreak < FAIL_STREAK_LIMIT) return;
+        failStreak = 0;
+        const wait = Math.min(FAIL_BACKOFF_BASE * 2 ** streakBackoffs, FAIL_BACKOFF_MAX);
+        streakBackoffs++;
+        backoffFor(`连续 ${FAIL_STREAK_LIMIT} 次失败，最近一次 HTTP ${status}`, Date.now() + wait);
+    }
+
+    // 有数据与无数据使用不同的 TTL
+    function isFresh(entry, now = Date.now()) {
+        if (!entry || typeof entry.t !== 'number') return false;
+        return now - entry.t < (hasInfo(entry.v) ? CACHE_TTL : CACHE_TTL_EMPTY);
+    }
+
+    // 把 localStorage 里的条目并入内存（以更新的 t 为准）
+    function mergeSavedCache(now = Date.now()) {
+        try {
+            const saved = JSON.parse(localStorage.getItem(CACHE_KEY) || '{}');
+            for (const [k, entry] of Object.entries(saved)) {
+                if (!isFresh(entry, now)) continue;
+                const mine = locationCache.get(k);
+                if (!mine || entry.t > mine.t) locationCache.set(k, entry);
+            }
+        } catch (err) {
+            // 忽略损坏的缓存
+        }
+    }
+
+    mergeSavedCache();
+    log('已恢复缓存条目数:', locationCache.size);
+
     let persistTimer = null;
+    let cacheDirty = false;
+
+    function writeCache() {
+        if (!cacheDirty) return;
+        cacheDirty = false;
+        try {
+            const now = Date.now();
+            mergeSavedCache(now); // 先吸收其他标签页写入的条目，避免整表覆盖丢数据
+
+            for (const [k, entry] of locationCache) {
+                if (!isFresh(entry, now)) locationCache.delete(k);
+            }
+            for (const [k, until] of errorUntil) {
+                if (until <= now) errorUntil.delete(k);
+            }
+            if (locationCache.size > CACHE_MAX_ENTRIES) {
+                const sorted = [...locationCache.entries()].sort((a, b) => a[1].t - b[1].t);
+                const drop = locationCache.size - CACHE_MAX_ENTRIES;
+                for (let i = 0; i < drop; i++) locationCache.delete(sorted[i][0]);
+            }
+            localStorage.setItem(CACHE_KEY, JSON.stringify(Object.fromEntries(locationCache)));
+        } catch (err) {
+            // 存储已满或被禁用时静默忽略
+        }
+    }
+
     function persistCache() {
+        cacheDirty = true;
         if (persistTimer) return; // 合并短时间内的多次写入
         persistTimer = setTimeout(() => {
             persistTimer = null;
-            try {
-                if (locationCache.size > CACHE_MAX_ENTRIES) {
-                    const sorted = [...locationCache.entries()].sort((a, b) => a[1].t - b[1].t);
-                    const drop = locationCache.size - CACHE_MAX_ENTRIES;
-                    for (let i = 0; i < drop; i++) locationCache.delete(sorted[i][0]);
-                }
-                localStorage.setItem(CACHE_KEY, JSON.stringify(Object.fromEntries(locationCache)));
-            } catch (e) {
-                // 存储已满或被禁用时静默忽略
-            }
+            writeCache();
         }, 1000);
+    }
+
+    function flushCache() {
+        if (persistTimer) {
+            clearTimeout(persistTimer);
+            persistTimer = null;
+        }
+        writeCache();
     }
 
     function getCached(screenName) {
         const e = locationCache.get(screenName.toLowerCase());
-        return e && Date.now() - e.t < CACHE_TTL ? e : null;
+        return isFresh(e) ? e : null;
+    }
+
+    // 该用户当前最早可以再次请求的时间（全局退避 / 单用户冷却）
+    function blockedUntil(key) {
+        return Math.max(globalBackoffUntil, errorUntil.get(key) || 0);
     }
 
     /*****************************************************************
@@ -328,12 +425,41 @@
     let discovering = null;
     let lastDiscoverAt = 0;
 
+    // 多路并发扫描 bundle，命中即停
+    async function scanBundlesForQueryId(urls) {
+        const reBefore = new RegExp(`queryId:"([\\w-]+)",operationName:"${OPERATION}"`);
+        const reAfter = new RegExp(`operationName:"${OPERATION}",[^}]{0,80}?queryId:"([\\w-]+)"`);
+
+        let next = 0;
+        let found = null;
+        const worker = async () => {
+            while (!found && next < urls.length) {
+                const u = urls[next++];
+                try {
+                    // bundle 多半已在浏览器缓存中，优先走缓存
+                    const res = await fetch(u, { cache: 'force-cache' });
+                    const txt = await res.text();
+                    const m = txt.match(reBefore) || txt.match(reAfter);
+                    if (m && !found) found = m[1];
+                } catch (e) {
+                    // 单个 bundle 失败不影响其余
+                }
+            }
+        };
+        await Promise.all(Array.from({ length: DISCOVER_CONCURRENCY }, worker));
+        return found;
+    }
+
+    // 返回 { status: 'found' | 'none' | 'throttled', id }
     function discoverQueryId() {
         if (discovering) return discovering;
-        if (Date.now() - lastDiscoverAt < QUERY_ID_RECHECK) return Promise.resolve(null);
+        if (Date.now() - lastDiscoverAt < QUERY_ID_RECHECK) {
+            return Promise.resolve({ status: 'throttled', id: null });
+        }
         lastDiscoverAt = Date.now();
 
         discovering = (async () => {
+            let id = null;
             try {
                 const urls = [
                     ...new Set([
@@ -346,22 +472,11 @@
                 const weight = (u) => (/\/(?:main|api)\./.test(u) ? 1 : 0);
                 urls.sort((a, b) => weight(b) - weight(a));
 
-                const reBefore = new RegExp(`queryId:"([\\w-]+)",operationName:"${OPERATION}"`);
-                const reAfter = new RegExp(`operationName:"${OPERATION}",[^}]{0,80}?queryId:"([\\w-]+)"`);
-
-                for (const u of urls.slice(0, 16)) {
-                    try {
-                        const txt = await (await fetch(u)).text();
-                        const m = txt.match(reBefore) || txt.match(reAfter);
-                        if (m) return m[1];
-                    } catch (e) {
-                        // 单个 bundle 失败不影响其余
-                    }
-                }
+                id = await scanBundlesForQueryId(urls.slice(0, DISCOVER_MAX_BUNDLES));
             } catch (e) {
                 log('自动发现 query ID 失败:', e);
             }
-            return null;
+            return id ? { status: 'found', id } : { status: 'none', id: null };
         })().finally(() => {
             discovering = null;
         });
@@ -389,23 +504,25 @@
         const send = () =>
             fetch(
                 `${location.origin}/i/api/graphql/${queryId}/${OPERATION}` +
-                    `?variables=${encodeURIComponent(JSON.stringify({ screenName }))}`,
+                `?variables=${encodeURIComponent(JSON.stringify({ screenName }))}`,
                 { method: 'GET', credentials: 'include', headers: requestHeaders() }
             );
 
         let res = await send();
-        if (res.status === 400 || res.status === 404) {
-            const fresh = await discoverQueryId();
-            if (fresh && fresh !== queryId) {
-                log('发现新的 query ID:', fresh);
-                queryId = fresh;
-                try {
-                    localStorage.setItem(QUERY_ID_KEY, JSON.stringify({ id: fresh, base: DEFAULT_QUERY_ID }));
-                } catch (e) {
-                    // ignore
-                }
-                res = await send();
+        if (res.status !== 400 && res.status !== 404) return res;
+
+        // 400/404：可能是 query ID 失效，也可能只是这个账号本身有问题（已删除 / 不存在）。
+        // 这里只负责尝试换新 ID；是否整体退避由调用方按「连续失败次数」判断
+        const d = await discoverQueryId();
+        if (d.status === 'found' && d.id !== queryId) {
+            log('发现新的 query ID:', d.id);
+            queryId = d.id;
+            try {
+                localStorage.setItem(QUERY_ID_KEY, JSON.stringify({ id: d.id, base: DEFAULT_QUERY_ID }));
+            } catch (e) {
+                // ignore
             }
+            res = await send();
         }
         return res;
     }
@@ -417,6 +534,9 @@
         const cached = getCached(screenName);
         if (cached) return cached.v;
         if (inFlightRequests.has(key)) return inFlightRequests.get(key);
+
+        // 未登录没有 ct0，请求必然失败
+        if (!getCsrfToken()) return null;
 
         if (now < globalBackoffUntil) {
             log('全局退避中，跳过请求:', screenName);
@@ -435,20 +555,35 @@
 
                 if (res.status === 429) {
                     const reset = Number(res.headers.get('x-rate-limit-reset')) * 1000;
-                    globalBackoffUntil = reset > Date.now() ? reset : Date.now() + DEFAULT_BACKOFF;
-                    log('遭遇 rate limit，退避至', new Date(globalBackoffUntil).toLocaleTimeString());
+                    backoffFor('HTTP 429 限流', reset > Date.now() ? reset : Date.now() + DEFAULT_BACKOFF);
                     throw new Error('HTTP 429');
                 }
-                if (res.status === 400 || res.status === 404) {
-                    // query ID 失效且自动发现也没找到：整体退避，避免刷请求
-                    log('HTTP', res.status, '：query ID 可能已失效');
-                    globalBackoffUntil = Date.now() + DEFAULT_BACKOFF;
+                if (res.status === 401) {
+                    // 登录态失效，对所有用户都一样
+                    backoffFor('HTTP 401 登录态失效', Date.now() + AUTH_BACKOFF);
+                    throw new Error('HTTP 401');
+                }
+                if (!res.ok) {
+                    // 400 / 403 / 404 等多半只是这个账号的问题：只做单用户冷却，连续多次才整体退避
+                    log('HTTP', res.status, '：', screenName);
+                    noteFailure(res.status);
                     throw new Error(`HTTP ${res.status}`);
                 }
-                if (res.status === 403) {
-                    log('HTTP 403：可能需要 x-client-transaction-id 等额外请求头');
+
+                failStreak = 0;
+                streakBackoffs = 0;
+                errorCount.delete(key);
+
+                // 根据剩余配额提前减速，而不是等撞上 429
+                const limit = Number(res.headers.get('x-rate-limit-limit'));
+                const remaining = res.headers.get('x-rate-limit-remaining');
+                const resetAt = Number(res.headers.get('x-rate-limit-reset')) * 1000;
+                rateLimit = limit > 0 ? limit : 0;
+                rateRemaining = remaining !== null ? Number(remaining) : null;
+                rateResetAt = resetAt > 0 ? resetAt : 0;
+                if (remaining !== null && Number(remaining) <= RATE_LIMIT_LOW && resetAt > Date.now()) {
+                    backoffFor(`配额即将用尽，剩余 ${remaining}${rateLimit ? ` / 上限 ${rateLimit}` : ''}`, resetAt);
                 }
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
                 const loc = extractLocationFromResponse(await res.json());
                 log('获得位置:', screenName, loc);
@@ -456,7 +591,10 @@
                 persistCache();
                 return loc;
             } catch (e) {
-                errorUntil.set(key, Date.now() + ERROR_COOLDOWN);
+                // 同一用户反复失败时冷却时间翻倍（1 → 2 → 4 … 分钟，上限 30 分钟），不再每分钟重试一次
+                const n = (errorCount.get(key) || 0) + 1;
+                errorCount.set(key, n);
+                errorUntil.set(key, Date.now() + Math.min(ERROR_COOLDOWN * 2 ** (n - 1), ERROR_COOLDOWN_MAX));
                 throw e;
             } finally {
                 inFlightRequests.delete(key);
@@ -764,14 +902,14 @@
 
             const label =
                 src.kind === 'ios' ? 'App Store' :
-                src.kind === 'android' ? 'Android' :
-                src.kind === 'web' ? t('web') :
-                src.raw;
+                    src.kind === 'android' ? 'Android' :
+                        src.kind === 'web' ? t('web') :
+                            src.raw;
             const icon =
                 src.kind === 'ios' ? 'apple' :
-                src.kind === 'android' ? 'android' :
-                src.kind === 'web' ? 'monitor' :
-                'globe';
+                    src.kind === 'android' ? 'android' :
+                        src.kind === 'web' ? 'monitor' :
+                            'globe';
 
             chips.push(
                 makeChip({
@@ -811,12 +949,19 @@
      * 悬浮资料卡（HoverCard）逻辑
      *****************************************************************/
 
+    // 优先选「文本与所在链接路径一致」的 @handle，避免把显示名恰好是 "@xxx" 的账号误认
     function findHandleSpan(card) {
+        let loose = null;
         for (const span of card.querySelectorAll('span')) {
             const text = span.textContent.trim();
-            if (text.startsWith('@') && text.length > 1) return span;
+            if (!HANDLE_RE.test(text)) continue;
+            const a = span.closest('a[href]');
+            if (a && (a.getAttribute('href') || '').toLowerCase() === `/${text.slice(1).toLowerCase()}`) {
+                return span;
+            }
+            if (!loose) loose = span;
         }
-        return null;
+        return loose;
     }
 
     function findDisplayNameAnchor(card, screenName) {
@@ -900,6 +1045,12 @@
                 return;
             }
 
+            // 未登录 / 全局退避 / 该用户冷却中：本来也发不出请求，不要先挂骨架屏再让它淡出
+            if (!getCsrfToken() || blockedUntil(key) > Date.now()) {
+                state.dismissed = true;
+                return;
+            }
+
             // 未命中：先挂骨架屏占位（高度与最终徽章一致，不会撑动卡片）
             renderSkeleton(root);
             mount(root, nameAnchor, handleSpan);
@@ -930,11 +1081,17 @@
     /*****************************************************************
      * 时间线推文 / 引用卡片：时间戳旁显示账号属地
      * 以各自的 User-Name 头部为单位，徽章插在「@handle · 时间」行末尾
+     *
+     * 队列按「用户」去重：同一用户在时间线上出现多次只排一次队，
+     * 请求完成后一并给所有仍在页面上的头部渲染徽章。
      *****************************************************************/
 
-    const tweetStates = new WeakMap(); // header -> { key, badge, info, pending, retryAt, done }
-    const tweetQueue = [];
+    const tweetStates = new WeakMap();   // header -> { key, badge, info, done }
+    const badgeMeta = new WeakMap();     // badge  -> { header, time }
+    const tweetQueue = [];               // 待处理条目：{ key, headers:Set<header> }
+    const tweetQueued = new Map();       // key -> 条目（排队中或正在请求中）
     let tweetQueueRunning = false;
+    let tweetOverflow = false;           // 队列满时丢弃过任务，排空后需要补扫
     let lastTweetFetchAt = 0;
 
     function findTweetHandleAnchor(header, screenName) {
@@ -967,10 +1124,10 @@
         // 详情页主推文：整条推文里找页脚时间，跳过引用卡片 / 嵌套头部自己的时间
         const article = header.closest(TWEET_SEL);
         if (article) {
-            for (const t of article.querySelectorAll('time')) {
-                if (!(header.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
-                const owner = t.closest(USER_NAME_SEL);
-                if (!owner || owner === header) return t;
+            for (const tm of article.querySelectorAll('time')) {
+                if (!(header.compareDocumentPosition(tm) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+                const owner = tm.closest(USER_NAME_SEL);
+                if (!owner || owner === header) return tm;
             }
             return null;
         }
@@ -1168,10 +1325,14 @@
         return badge;
     }
 
-    function renderTweetBadge(header, state) {
-        const meta = findTweetMeta(header);
+    function renderTweetBadge(header, state, meta) {
+        meta = meta || findTweetMeta(header);
         if (!meta || meta.screenName.toLowerCase() !== state.key) return;
-        if (state.badge && state.badge.isConnected && state.badge.__xltHeader === header) return;
+
+        if (state.badge && state.badge.isConnected) {
+            const bm = badgeMeta.get(state.badge);
+            if (bm && bm.header === header) return;
+        }
 
         if (!state.badge || !state.badge.isConnected) {
             const badge = createTweetBadge(state.info, meta.timeAnchor);
@@ -1179,18 +1340,127 @@
                 state.done = true;
                 return;
             }
-            badge.__xltHeader = header;
-            badge.__xltTime = meta.timeAnchor;
+            badgeMeta.set(badge, { header, time: meta.timeAnchor });
             state.badge = badge;
         }
         insertTweetBadge(meta, state.badge);
     }
 
-    function enqueueTweetFetch(task) {
-        if (tweetQueue.length >= TWEET_QUEUE_LIMIT) return false;
-        tweetQueue.push(task);
-        pumpTweetQueue();
-        return true;
+    /* ---------- 重扫调度（退避 / 冷却结束后自动补扫） ---------- */
+
+    let rescanTimer = null;
+    let rescanDue = 0;
+
+    function scheduleRescanAt(time) {
+        const at = Math.max(time, Date.now() + 500);
+        if (rescanTimer && rescanDue <= at) return;
+        clearTimeout(rescanTimer);
+        rescanDue = at;
+        rescanTimer = setTimeout(() => {
+            rescanTimer = null;
+            rescanDue = 0;
+            scheduleScan();
+        }, at - Date.now());
+    }
+
+    /* ---------- 队列 ---------- */
+
+    function waitVisible() {
+        return new Promise((resolve) => {
+            const on = () => {
+                if (document.hidden) return;
+                document.removeEventListener('visibilitychange', on);
+                resolve();
+            };
+            document.addEventListener('visibilitychange', on);
+        });
+    }
+
+    // 条目里仍在页面上的头部，距视口中线的最小距离；全部已移除则为 Infinity
+    function tweetDistance(item) {
+        const mid = window.innerHeight / 2;
+        let best = Infinity;
+        for (const h of item.headers) {
+            if (!h.isConnected) continue;
+            const r = h.getBoundingClientRect();
+            best = Math.min(best, Math.abs((r.top + r.bottom) / 2 - mid));
+        }
+        return best;
+    }
+
+    // 取下一个要处理的条目：已有缓存的立即处理；否则选离视口中线最近的；顺手清理已滚走的
+    function takeNextTweetItem() {
+        const alive = [];
+        let best = null;
+        let bestDist = Infinity;
+
+        for (const item of tweetQueue) {
+            if (getCached(item.key)) {
+                tweetQueue.splice(tweetQueue.indexOf(item), 1);
+                return item;
+            }
+            const d = tweetDistance(item);
+            if (d === Infinity) {
+                tweetQueued.delete(item.key);
+                continue;
+            }
+            alive.push(item);
+            if (d < bestDist) {
+                bestDist = d;
+                best = item;
+            }
+        }
+
+        tweetQueue.length = 0;
+        for (const item of alive) if (item !== best) tweetQueue.push(item);
+        return best;
+    }
+
+    async function runTweetItem(item) {
+        let info = null;
+        try {
+            info = await fetchAccountLocation(item.key);
+        } catch (e) {
+            log('推文属地查询失败:', item.key, e.message || e);
+        } finally {
+            tweetQueued.delete(item.key);
+        }
+
+        if (!showTimeline) return; // 请求期间被关掉了：结果已进缓存，不再渲染
+
+        if (!hasInfo(info)) {
+            // 缓存里已有（含「无数据」）时下次扫描会处理；否则等退避 / 冷却结束再试
+            if (!getCached(item.key)) {
+                let until = blockedUntil(item.key);
+                if (until <= Date.now()) {
+                    until = Date.now() + TWEET_RETRY_DELAY;
+                    errorUntil.set(item.key, until);
+                }
+                scheduleRescanAt(until);
+            }
+            return;
+        }
+
+        // 同一用户在页面上的所有头部一并渲染
+        for (const header of item.headers) {
+            if (!header.isConnected) continue;
+            const state = tweetStates.get(header);
+            if (!state || state.key !== item.key || state.done) continue;
+            state.info = info;
+            const meta = findTweetMeta(header);
+            if (meta) renderTweetBadge(header, state, meta);
+        }
+    }
+
+    // 剩余配额充足时按固定间隔快速请求；低于上限的一半后，把剩余配额摊到窗口重置前，
+    // 避免一口气烧光之后整段时间都没有徽章
+    function tweetFetchInterval() {
+        const now = Date.now();
+        if (rateLimit > 0 && rateRemaining !== null && rateResetAt > now && rateRemaining < rateLimit * PACE_BELOW) {
+            const spread = (rateResetAt - now) / Math.max(1, rateRemaining - RATE_LIMIT_LOW);
+            return Math.min(Math.max(TWEET_FETCH_INTERVAL, spread), TWEET_PACE_MAX);
+        }
+        return TWEET_FETCH_INTERVAL;
     }
 
     async function pumpTweetQueue() {
@@ -1198,63 +1468,83 @@
         tweetQueueRunning = true;
         try {
             while (tweetQueue.length) {
-                const wait = lastTweetFetchAt + TWEET_FETCH_INTERVAL - Date.now();
-                if (wait > 0) await sleep(wait);
-                lastTweetFetchAt = Date.now();
-                const task = tweetQueue.shift();
+                if (document.hidden) {
+                    await waitVisible(); // 标签页在后台时暂停出队
+                    continue;
+                }
+
+                const item = takeNextTweetItem();
+                if (!item) break;
+
+                // 只有真要发网络请求时才限速；缓存命中 / 已滚走的条目不占间隔
+                if (!getCached(item.key) && Date.now() >= globalBackoffUntil) {
+                    const wait = lastTweetFetchAt + tweetFetchInterval() - Date.now();
+                    if (wait > 0) {
+                        // 放回队列，等完再重新挑选：这段时间里视口可能已经滚到别处
+                        tweetQueue.push(item);
+                        await sleep(wait);
+                        continue;
+                    }
+                    lastTweetFetchAt = Date.now();
+                }
+
                 try {
-                    await task();
+                    await runTweetItem(item);
                 } catch (e) {
                     log('推文属地队列任务失败:', e.message || e);
                 }
             }
         } finally {
             tweetQueueRunning = false;
+            if (tweetOverflow) {
+                tweetOverflow = false;
+                scheduleScan(); // 之前被拒绝的头部补一次扫描
+            }
         }
     }
 
-    function ensureTweetBadge(header, state) {
+    function ensureTweetBadge(header, state, meta) {
         if (state.done) return;
         if (state.info) {
-            if (!state.badge || !state.badge.isConnected) renderTweetBadge(header, state);
+            if (!state.badge || !state.badge.isConnected) renderTweetBadge(header, state, meta);
             return;
         }
-        if (state.pending || Date.now() < state.retryAt) return;
 
         const cached = getCached(state.key);
         if (cached) {
             if (hasInfo(cached.v)) {
                 state.info = cached.v;
-                renderTweetBadge(header, state);
+                renderTweetBadge(header, state, meta);
             } else {
                 state.done = true;
             }
             return;
         }
 
-        state.pending = true;
-        const accepted = enqueueTweetFetch(async () => {
-            if (!header.isConnected || tweetStates.get(header) !== state) {
-                state.pending = false;
-                return;
-            }
-            let info = null;
-            try {
-                info = await fetchAccountLocation(state.key);
-            } catch (e) {
-                log('推文属地查询失败:', state.key, e.message || e);
-            }
-            state.pending = false;
-            if (tweetStates.get(header) !== state) return;
+        // 该用户已在排队 / 请求中：只登记这个头部，完成后一起渲染
+        const queued = tweetQueued.get(state.key);
+        if (queued) {
+            queued.headers.add(header);
+            return;
+        }
 
-            if (!hasInfo(info)) {
-                state.retryAt = Date.now() + TWEET_RETRY_DELAY;
-                return;
-            }
-            state.info = info;
-            if (header.isConnected) renderTweetBadge(header, state);
-        });
-        if (!accepted) state.pending = false;
+        if (!getCsrfToken()) return; // 未登录
+
+        const until = blockedUntil(state.key);
+        if (until > Date.now()) {
+            scheduleRescanAt(until);
+            return;
+        }
+
+        if (tweetQueue.length >= TWEET_QUEUE_LIMIT) {
+            tweetOverflow = true;
+            return;
+        }
+
+        const item = { key: state.key, headers: new Set([header]) };
+        tweetQueue.push(item);
+        tweetQueued.set(state.key, item);
+        pumpTweetQueue();
     }
 
     // 切换明暗主题后，时间戳颜色会变；同步刷新已挂载徽章的颜色
@@ -1264,9 +1554,9 @@
         badgeColorTimer = setTimeout(() => {
             badgeColorTimer = null;
             document.querySelectorAll(TWEET_BADGE_SEL).forEach((badge) => {
-                const time = badge.__xltTime;
-                if (!time || !time.isConnected) return;
-                syncTweetBadgeStyle(badge, time);
+                const bm = badgeMeta.get(badge);
+                if (!bm || !bm.time || !bm.time.isConnected) return;
+                syncTweetBadgeStyle(badge, bm.time);
             });
         }, 150);
     }
@@ -1280,17 +1570,10 @@
             let state = tweetStates.get(header);
             if (!state || state.key !== key) {
                 if (state && state.badge) state.badge.remove();
-                state = {
-                    key,
-                    badge: null,
-                    info: null,
-                    pending: false,
-                    retryAt: 0,
-                    done: false,
-                };
+                state = { key, badge: null, info: null, done: false };
                 tweetStates.set(header, state);
             }
-            ensureTweetBadge(header, state);
+            ensureTweetBadge(header, state, meta);
         });
     }
 
@@ -1302,7 +1585,48 @@
 
     function scanAll() {
         scanHoverCards();
-        scanTweets();
+        if (showTimeline) scanTweets();
+    }
+
+    /* ---------- 设置：时间线推文是否显示属地 ---------- */
+
+    let menuId = null;
+
+    function registerMenu() {
+        if (typeof GM_registerMenuCommand !== 'function') return;
+        try {
+            if (menuId !== null && typeof GM_unregisterMenuCommand === 'function') {
+                GM_unregisterMenuCommand(menuId);
+            }
+            menuId = GM_registerMenuCommand(t(showTimeline ? 'menuOn' : 'menuOff'), () => {
+                setTimelineSetting(!showTimeline);
+            });
+        } catch (e) {
+            log('注册菜单失败:', e);
+        }
+    }
+
+    function applyTimelineSetting(on) {
+        if (on === showTimeline) return;
+        showTimeline = on;
+        if (on) {
+            scheduleScan();
+        } else {
+            // 关闭：清空排队中的请求，移除已挂载的时间线徽章（悬浮卡不受影响）
+            tweetQueue.length = 0;
+            tweetQueued.clear();
+            document.querySelectorAll(TWEET_BADGE_SEL).forEach((el) => el.remove());
+        }
+        registerMenu();
+    }
+
+    function setTimelineSetting(on) {
+        try {
+            localStorage.setItem(TIMELINE_KEY, on ? '1' : '0');
+        } catch (e) {
+            // 存储被禁用时仅本次页面内有效
+        }
+        applyTimelineSetting(on);
     }
 
     function scheduleScan() {
@@ -1315,22 +1639,20 @@
     }
 
     function init() {
-        log('归属地标注脚本启动 v0.37');
+        log('归属地标注脚本启动 v0.41');
         injectStyles();
+        registerMenu();
         scanAll();
 
         const mo = new MutationObserver((mutations) => {
+            // 时间线关闭时只关心悬浮卡，减少无谓的扫描
+            const sel = showTimeline ? TRIGGER_SEL : CARD_SEL;
             for (const m of mutations) {
                 for (const n of m.addedNodes) {
                     if (n.nodeType !== 1) continue;
                     if (n.closest && (n.closest(OWN_SEL) || n.closest(TWEET_BADGE_SEL))) continue;
                     // 新卡片出现，或卡片 / 推文内部内容异步渲染完成
-                    if (
-                        n.matches(CARD_SEL) || n.closest(CARD_SEL) || n.querySelector(CARD_SEL) ||
-                        n.matches(TWEET_SEL) || n.closest(TWEET_SEL) || n.querySelector(TWEET_SEL) ||
-                        n.matches(USER_NAME_SEL) || n.closest(USER_NAME_SEL) || n.querySelector(USER_NAME_SEL) ||
-                        n.matches('time') || n.querySelector('time')
-                    ) {
+                    if (n.closest(sel) || n.querySelector(sel)) {
                         scheduleScan();
                         return;
                     }
@@ -1360,6 +1682,17 @@
         } catch (e) {
             // ignore
         }
+
+        // 其他标签页改了开关时同步
+        window.addEventListener('storage', (e) => {
+            if (e.key === TIMELINE_KEY) applyTimelineSetting(e.newValue === '1');
+        });
+
+        // 页面关闭 / 切到后台前，立即把防抖期内的缓存落盘
+        window.addEventListener('pagehide', flushCache);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) flushCache();
+        });
     }
 
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
